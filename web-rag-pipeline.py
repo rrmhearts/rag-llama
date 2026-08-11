@@ -212,10 +212,35 @@ def web_search(keywords: str, max_results: int = 3) -> List[str]:
         with DDGS() as ddgs:
             results = ddgs.text(keywords, max_results=max_results)
             for r in results:
-                print(f"Found: {r['title']} -> {r['href']}")
-                urls.append(r['href'])
+                # ddgs.text() returns 'href' while ddgs.news() returns 'url'
+                url = r.get('href') or r.get('url')
+                if url:
+                    print(f"Found Web: {r.get('title', 'No Title')} -> {url}")
+                    urls.append(url)
     except Exception as e:
         print(f"Web search error: {e}")
+    return urls
+
+
+def news_search(keywords: str, max_results: int = 3, timelimit: str = "w") -> List[str]:
+    """
+    Queries DuckDuckGo news search for recent articles and extracts relevant links.
+    Supports timelimit parameters such as 'd' (day), 'w' (week), or 'm' (month).
+    """
+    urls = []
+    try:
+        print(f"Executing recent news search for: '{keywords}' (timelimit='{timelimit}')...")
+        with DDGS() as ddgs:
+            results = ddgs.news(keywords, timelimit=timelimit, max_results=max_results)
+            for r in results:
+                url = r.get('url') or r.get('href')
+                if url:
+                    source = r.get('source', 'Unknown Source')
+                    date = r.get('date', 'Unknown Date')
+                    print(f"Found News [{source} | {date}]: {r.get('title', 'No Title')} -> {url}")
+                    urls.append(url)
+    except Exception as e:
+        print(f"News search error: {e}")
     return urls
 
 
@@ -364,8 +389,17 @@ def run_web_rag_pipeline(question: str, slm_model: str = "qwen2.5:1.5b") -> str:
     extracted_context_parts = []
     
     if search_needed and keywords and keywords.lower() != "none":
-        # 2. Web search
-        search_urls = web_search(keywords, max_results=3)
+        # 2. Web & News search (fetch general pages + recent news articles)
+        web_urls = web_search(keywords, max_results=2)
+        news_urls = news_search(keywords, max_results=2, timelimit="w")
+        
+        # Merge and deduplicate URLs while preserving order
+        seen_urls = set()
+        search_urls = []
+        for u in web_urls + news_urls:
+            if u not in seen_urls:
+                seen_urls.add(u)
+                search_urls.append(u)
         
         # 3. Fetch, clean, tag, and extract facts
         for idx, url in enumerate(search_urls, 1):
@@ -410,5 +444,8 @@ def run_web_rag_pipeline(question: str, slm_model: str = "qwen2.5:1.5b") -> str:
 
 if __name__ == "__main__":
     # Test Question (Requires Real-time freshness)
-    question = "Who won the latest Formula 1 race and what team do they drive for?"
+    question = "What is the capital of Wisconsin? "
+    # question = "In the news, what country did Donald Trump recently leave?"
+    # question = "Who is the richest man in the world?"
+    # question = "Who won the latest Formula 1 race and what team do they drive for?"
     run_web_rag_pipeline(question)
