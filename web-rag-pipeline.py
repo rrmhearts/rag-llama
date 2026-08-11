@@ -1,16 +1,46 @@
-import re
-import urllib.request
-import urllib.error
-from bs4 import BeautifulSoup
-import ollama
-from ddgs import DDGS
 import os
+import re
+import urllib.error
+import urllib.request
+from typing import Dict, List, Set, Tuple
+from bs4 import BeautifulSoup
+from ddgs import DDGS
+import ollama
+
+# =====================================================================
+# 0. Configuration & Global Constants
+# =====================================================================
+
+# Minimal stopword set to prevent trivial matches on query phrasing
+STOPWORDS: Set[str] = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "from",
+    "by", "with", "of", "for", "is", "are", "was", "were", "be", "been",
+    "do", "does", "did", "what", "who", "where", "when", "why", "how",
+    "which", "that", "this", "these", "those", "it", "its", "can", "could",
+    "should", "would", "about", "did", "have", "has", "had"
+}
+
+DEFAULT_HEADERS: Dict[str, str] = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
+
+# Pre-compiled regex patterns for performance
+ABBREV_PATTERN = re.compile(
+    r'\b(?:Mr|Mrs|Ms|Dr|Prof|Gen|Rep|Sen|St|Jr|Sr|vs|etc|i\.e\.|e\.g\.|'
+    r'Fig|Eq|No|Vol|Inc|Co|Corp|Ltd|U\.S\.|U\.K\.)',
+    re.IGNORECASE
+)
+REF_HEADING_PATTERN = re.compile(
+    r'^(references|sources(\s+cited)?|bibliography|works\s+cited|citations|footnotes)\s*$',
+    re.IGNORECASE
+)
+
 
 # =====================================================================
 # 1. HTML Tagging Finite State Machine (FSM)
 # =====================================================================
 
-def segment_and_tag_text(raw_text: str):
+def segment_and_tag_text(raw_text: str) -> Tuple[str, Dict[str, str]]:
     """
     Strips bracketed citations (e.g., [7], [1, 2], [3-5]), segments raw text 
     sentence-by-sentence while ignoring decimals and common abbreviations, 
@@ -36,12 +66,7 @@ def segment_and_tag_text(raw_text: str):
 
     # 3. MASK ABBREVIATIONS: Replace periods in common abbreviations with <DOT>
     # Using a callback function guarantees clean case-insensitive matching
-    abbrev_pattern = re.compile(
-        r'\b(?:Mr|Mrs|Ms|Dr|Prof|Gen|Rep|Sen|St|Jr|Sr|vs|etc|i\.e\.|e\.g\.|'
-        r'Fig|Eq|No|Vol|Inc|Co|Corp|Ltd|U\.S\.|U\.K\.)',
-        re.IGNORECASE
-    )
-    text = abbrev_pattern.sub(lambda m: m.group(0).replace('.', '<DOT>'), text)
+    text = ABBREV_PATTERN.sub(lambda m: m.group(0).replace('.', '<DOT>'), text)
 
     # 4. SPLIT SENTENCES: Now safe to split after any '.', '!', or '?' followed by whitespace
     # Using a 1-character fixed-width lookbehind (?<=[.!?]) works natively in Python re
@@ -68,51 +93,50 @@ def segment_and_tag_text(raw_text: str):
             
     return "\n".join(tagged_segments), tag_map
 
+
 # =====================================================================
 # 2. Web Ingestion & Cleanup (BeautifulSoup)
 # =====================================================================
 
-def fetch_and_clean_html(url, timeout=10):
+def _clean_html_soup(soup: BeautifulSoup) -> None:
+    """Helper function to decompose boilerplate, tables, and reference sections."""
+    # 1. Remove standard boilerplate + TABLES
+    for element in soup(["script", "style", "nav", "header", "footer", "aside", "table"]):
+        element.decompose()
+        
+    # 2. Remove common inline citation tags/classes (e.g., Wikipedia superscripts, footnote links)
+    for ref_elem in soup.find_all(
+        lambda tag: tag.name in ["sup", "ol", "ul", "div", "section"] and 
+        any(
+            cls in " ".join(tag.get("class", [])).lower() or 
+            cls in (tag.get("id") or "").lower()
+            for cls in ["reference", "references", "citation", "citations", "cite", "biblio", "footnote"]
+        )
+    ):
+        ref_elem.decompose()
+
+    # 3. Strip trailing "References", "Sources Cited", or "Bibliography" sections by heading
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        if REF_HEADING_PATTERN.match(heading.get_text(strip=True)):
+            # Remove all subsequent siblings (the actual reference list below the heading)
+            for sibling in list(heading.find_next_siblings()):
+                sibling.decompose()
+            heading.decompose()
+
+
+def fetch_and_clean_html(url: str, timeout: int = 10) -> str:
     """
     Scrapes a web page, parses HTML using BeautifulSoup, and extracts 
     clean body text while discarding headers, footers, scripts, nav bars,
     tables, and obvious references/sources sections.
     """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             html = response.read()
             soup = BeautifulSoup(html, 'html.parser')
             
-            # 1. Remove standard boilerplate + TABLES
-            for element in soup(["script", "style", "nav", "header", "footer", "aside", "table"]):
-                element.decompose()
-                
-            # 2. Remove common inline citation tags/classes (e.g., Wikipedia superscripts, footnote links)
-            for ref_elem in soup.find_all(
-                lambda tag: tag.name in ["sup", "ol", "ul", "div", "section"] and 
-                any(
-                    cls in " ".join(tag.get("class", [])).lower() or 
-                    cls in (tag.get("id") or "").lower()
-                    for cls in ["reference", "references", "citation", "citations", "cite", "biblio", "footnote"]
-                )
-            ):
-                ref_elem.decompose()
-
-            # 3. Strip trailing "References", "Sources Cited", or "Bibliography" sections by heading
-            ref_heading_pattern = re.compile(
-                r'^(references|sources(\s+cited)?|bibliography|works\s+cited|citations|footnotes)\s*$', 
-                re.IGNORECASE
-            )
-            for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
-                if ref_heading_pattern.match(heading.get_text(strip=True)):
-                    # Remove all subsequent siblings (the actual reference list below the heading)
-                    for sibling in list(heading.find_next_siblings()):
-                        sibling.decompose()
-                    heading.decompose()
+            _clean_html_soup(soup)
                 
             # 4. Extract plain text from body
             body = soup.find('body')
@@ -138,7 +162,7 @@ def fetch_and_clean_html(url, timeout=10):
 # 3. Collaborative Pipeline Components (Ollama & DDGS)
 # =====================================================================
 
-def parser_llm(user_query, model_name="qwen2.5:1.5b"):
+def parser_llm(user_query: str, model_name: str = "qwen2.5:1.5b") -> Tuple[bool, str]:
     """
     Step 1 of the Paradigm: Multi-functional Parser-LLM.
     Determines if search is needed and extracts clean keywords in a single pass.
@@ -178,7 +202,7 @@ def parser_llm(user_query, model_name="qwen2.5:1.5b"):
     return search_needed, keywords
 
 
-def web_search(keywords, max_results=3):
+def web_search(keywords: str, max_results: int = 3) -> List[str]:
     """
     Queries DuckDuckGo search and extracts a list of relevant links.
     """
@@ -195,21 +219,8 @@ def web_search(keywords, max_results=3):
     return urls
 
 
-# Minimal stopword set to prevent trivial matches on query phrasing
-STOPWORDS = {
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "from",
-    "by", "with", "of", "for", "is", "are", "was", "were", "be", "been",
-    "do", "does", "did", "what", "who", "where", "when", "why", "how",
-    "which", "that", "this", "these", "those", "it", "its", "can", "could",
-    "should", "would", "about", "did", "have", "has", "had"
-}
-
-def extractor_llm(request, tagged_content, model_name="qwen2.5:1.5b", window=1):
-    """
-    Step 5 of the Paradigm: Extractor-LLM.
-    Pre-filters tagged_content using keyword matching + a nearby-tag window,
-    then uses a highly constrained prompt to return ONLY relevant tag identifiers.
-    """
+def _prefilter_tagged_content(request: str, tagged_content: str, window: int) -> str:
+    """Helper function to filter tagged content using keyword matching + window expansion."""
     # 1. Extract query keywords (lowercase, alphanumeric alphanumeric stems, ignoring stopwords)
     raw_words = re.findall(r'\b[a-z0-9]+\b', request.lower())
     keywords = {word for word in raw_words if word not in STOPWORDS and len(word) > 1}
@@ -250,7 +261,18 @@ def extractor_llm(request, tagged_content, model_name="qwen2.5:1.5b", window=1):
         f"<{parsed_tags[i][0]}>{parsed_tags[i][1]}</{parsed_tags[i][0]}>"
         for i in sorted_indices
     ]
-    filtered_content = "\n".join(filtered_tags)
+    return "\n".join(filtered_tags)
+
+
+def extractor_llm(request: str, tagged_content: str, model_name: str = "qwen2.5:1.5b", window: int = 1) -> str:
+    """
+    Step 5 of the Paradigm: Extractor-LLM.
+    Pre-filters tagged_content using keyword matching + a nearby-tag window,
+    then uses a highly constrained prompt to return ONLY relevant tag identifiers.
+    """
+    filtered_content = _prefilter_tagged_content(request, tagged_content, window)
+    if filtered_content == "None":
+        return "None"
 
     # 5. Build prompt with pre-filtered content
     prompt_template = f"""
@@ -283,7 +305,8 @@ Output tags or 'None':"""
     
     return response['message']['content'].strip()
 
-def generator_llm(user_query, retrieved_facts, model_name="qwen2.5:1.5b"):
+
+def generator_llm(user_query: str, retrieved_facts: str, model_name: str = "qwen2.5:1.5b") -> str:
     """
     Step 7 of the Paradigm: Backbone Generative-LLM.
     Generates the final response grounded completely in the clean extracted context.
@@ -318,7 +341,21 @@ Question: {user_query}
 # 4. End-to-End Pipeline Execution
 # =====================================================================
 
-def run_web_rag_pipeline(question, slm_model="qwen2.5:1.5b"):
+def _extract_matched_segments(extracted_tags_str: str, tag_map: Dict[str, str]) -> List[str]:
+    """Helper to map extracted TAG-i names back to their original segment sentences."""
+    if not extracted_tags_str or extracted_tags_str.lower() == "none":
+        return []
+    
+    # Find all occurrences of TAG-i patterns
+    tags_found = re.findall(r'TAG-\d+', extracted_tags_str)
+    valid_segments = []
+    for t in tags_found:
+        if t in tag_map:
+            valid_segments.append(tag_map[t])
+    return valid_segments
+
+
+def run_web_rag_pipeline(question: str, slm_model: str = "qwen2.5:1.5b") -> str:
     print(f"Initializing Web RAG Pipeline for question: '{question}'...")
     
     # 1. Intent check & Keyword Extraction (Parser-LLM)
@@ -341,23 +378,17 @@ def run_web_rag_pipeline(question, slm_model="qwen2.5:1.5b"):
             # Apply tagging FSM
             tagged_content, tag_map = segment_and_tag_text(raw_body)
             print("TAGGED_CONTENT:", tagged_content)
+            
             # Extract relevant tags (Extractor-LLM)
             extracted_tags_str = extractor_llm(question, tagged_content, model_name=slm_model)
             print(f"  Extractor returned tags: '{extracted_tags_str}'")
             
             # Retrieve segment content mapped to extracted tags
-            if extracted_tags_str and extracted_tags_str.lower() != "none":
-                # Find all occurrences of TAG-i patterns
-                tags_found = re.findall(r'TAG-\d+', extracted_tags_str)
-                valid_segments = []
-                for t in tags_found:
-                    if t in tag_map:
-                        valid_segments.append(tag_map[t])
-                
-                if valid_segments:
-                    source_context = " ".join(valid_segments)
-                    extracted_context_parts.append(f"[Source: {url}]: {source_context}")
-                    print(f"  ✓ Successfully extracted {len(valid_segments)} relevant facts.")
+            valid_segments = _extract_matched_segments(extracted_tags_str, tag_map)
+            if valid_segments:
+                source_context = " ".join(valid_segments)
+                extracted_context_parts.append(f"[Source: {url}]: {source_context}")
+                print(f"  ✓ Successfully extracted {len(valid_segments)} relevant facts.")
             else:
                 print("  ✗ No relevant facts found in this source.")
                 
@@ -379,5 +410,5 @@ def run_web_rag_pipeline(question, slm_model="qwen2.5:1.5b"):
 
 if __name__ == "__main__":
     # Test Question (Requires Real-time freshness)
-    question = "Who is the richest man in the world?"
+    question = "Who won the latest Formula 1 race and what team do they drive for?"
     run_web_rag_pipeline(question)
