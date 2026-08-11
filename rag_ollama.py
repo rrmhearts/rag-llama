@@ -1,20 +1,22 @@
 import sys
-from duckduckgo_search import DDGS
+# Updated import to use the new 'ddgs' package name
+from ddgs import DDGS
 import ollama
 
 
 def search_web(query, max_results=4):
-  """Performs a free DuckDuckGo search without an API key."""
+  """Performs a free DuckDuckGo search using the ddgs library."""
   print(f"\n🌐 Searching the web for: '{query}'...")
   try:
     results = DDGS().text(query, max_results=max_results)
     snippets = []
     for i, r in enumerate(results, 1):
+      # Fallbacks added for URL and Body keys across different library versions
       title = r.get("title", "No Title")
-      href = r.get("href", "")
-      body = r.get("body", "")
+      url = r.get("href") or r.get("url", "")
+      body = r.get("body") or r.get("snippet", "")
       snippets.append(
-          f"[{i}] Title: {title}\nURL: {href}\nSnippet: {body}\n---"
+          f"[{i}] Title: {title}\nURL: {url}\nSnippet: {body}\n---"
       )
     return "\n".join(snippets)
   except Exception as e:
@@ -58,7 +60,8 @@ def main():
       # 3. Stream response from local Ollama
       print(f"\n🧠 {model_name}: ", end="", flush=True)
 
-      print(augmented_prompt)
+      print("PROMPT:", augmented_prompt)
+
       stream = ollama.chat(
           model=model_name,
           messages=[{"role": "user", "content": augmented_prompt}],

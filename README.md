@@ -1,5 +1,5 @@
 
 
 ```
-pip install ollama duckduckgo-search
+pip install ollama ddgs
 ```
