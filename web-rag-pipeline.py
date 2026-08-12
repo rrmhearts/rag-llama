@@ -20,6 +20,12 @@ STOPWORDS: Set[str] = {
     "should", "would", "about", "did", "have", "has", "had"
 }
 
+# Add this near your STOPWORDS and DEFAULT_HEADERS
+MERGE_PRONOUNS = {
+    "He", "She", "It", "They", "This", "That", "These", "Those", 
+    "His", "Her", "Its", "Their"
+}
+
 DEFAULT_HEADERS: Dict[str, str] = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
@@ -42,54 +48,66 @@ REF_HEADING_PATTERN = re.compile(
 
 def segment_and_tag_text(raw_text: str) -> Tuple[str, Dict[str, str]]:
     """
-    Strips bracketed citations (e.g., [7], [1, 2], [3-5]), segments raw text 
-    sentence-by-sentence while ignoring decimals and common abbreviations, 
-    and encloses each clean segment in a sequential XML-style tag.
-    
-    Returns:
-        tagged_text (str): The text with <TAG-i>...</TAG-i> wrappers.
-        tag_map (dict): A dictionary mapping "TAG-i" to the raw sentence content.
+    Processes text block-by-block, ensuring sentences don't bleed across 
+    HTML boundaries. Enforces strict capitalization, punctuation, and word counts.
     """
     if not raw_text:
         return "", {}
 
-    # 1. Strip bracketed numeric citations: [7], [12, 14], [3–5], etc.
+    # Strip bracketed numeric citations
     text = re.sub(r'\[\s*\d+(?:\s*[,–-]\s*\d+)*\s*\]', '', raw_text)
     
-    # Clean up any leftover space before punctuation caused by removing citations
-    # e.g., "efficiency [7]." -> "efficiency ." -> "efficiency."
-    text = re.sub(r'\s+([.!?])', r'\1', text)
+    # Process block by block (separated by our injected \n\n)
+    html_blocks = text.split('\n\n')
+    processed_segments = []
+    
+    for block in html_blocks:
+        block = block.strip()
+        if not block:
+            continue
+            
+        # MASK DECIMALS & ABBREVIATIONS within the isolated block
+        block = re.sub(r'(\d)\.(\d)', r'\1<DOT>\2', block)
+        block = ABBREV_PATTERN.sub(lambda m: m.group(0).replace('.', '<DOT>'), block)
+        
+        # SPLIT SENTENCES inside this safe HTML block
+        sentences = re.split(r'(?<=[.!?])\s+', block)
+        
+        for seg in sentences:
+            unmasked_seg = seg.replace('<DOT>', '.').strip()
+            if not unmasked_seg:
+                continue
+                
+            # STRICT HEURISTICS
+            # Must start with uppercase
+            if not re.match(r'^[A-Z]', unmasked_seg): 
+                continue
+            # Must end with valid punctuation
+            if unmasked_seg[-1] not in '.!?': 
+                continue
+                
+            # Must have at least 4 alphabetical words (filters out data rows/number lists)
+            alpha_words = [w for w in unmasked_seg.split() if re.search(r'[a-zA-Z]', w)]
+            if len(alpha_words) < 4:
+                continue
+                
+            # Pronoun merging logic
+            first_word = re.sub(r'[^a-zA-Z]', '', unmasked_seg.split()[0])
+            if first_word in MERGE_PRONOUNS and processed_segments:
+                processed_segments[-1] = processed_segments[-1] + " " + unmasked_seg
+            else:
+                processed_segments.append(unmasked_seg)
 
-    # 2. MASK DECIMALS: Replace period between digits with a temporary placeholder
-    # e.g., "3.14" -> "3<DOT>14"
-    text = re.sub(r'(\d)\.(\d)', r'\1<DOT>\2', text)
-
-    # 3. MASK ABBREVIATIONS: Replace periods in common abbreviations with <DOT>
-    # Using a callback function guarantees clean case-insensitive matching
-    text = ABBREV_PATTERN.sub(lambda m: m.group(0).replace('.', '<DOT>'), text)
-
-    # 4. SPLIT SENTENCES: Now safe to split after any '.', '!', or '?' followed by whitespace
-    # Using a 1-character fixed-width lookbehind (?<=[.!?]) works natively in Python re
-    raw_segments = re.split(r'(?<=[.!?])\s+', text.strip())
-
-    # 5. UNMASK & TAG: Restore periods and wrap clean segments
+    # UNMASK & TAG
     tagged_segments = []
     tag_map = {}
     tag_counter = 1
     
-    for seg in raw_segments:
-        # Restore masked periods
-        unmasked_seg = seg.replace('<DOT>', '.')
-        
-        # Normalize internal whitespace
-        clean_seg = re.sub(r'\s+', ' ', unmasked_seg).strip()
-        
-        # Skip empty or trivial segments (e.g., stray punctuation)
-        if len(clean_seg) > 5:
-            tag_name = f"TAG-{tag_counter}"
-            tagged_segments.append(f"<{tag_name}>{clean_seg}</{tag_name}>")
-            tag_map[tag_name] = clean_seg
-            tag_counter += 1
+    for clean_seg in processed_segments:
+        tag_name = f"TAG-{tag_counter}"
+        tagged_segments.append(f"<{tag_name}>{clean_seg}</{tag_name}>")
+        tag_map[tag_name] = clean_seg
+        tag_counter += 1
             
     return "\n".join(tagged_segments), tag_map
 
@@ -99,12 +117,45 @@ def segment_and_tag_text(raw_text: str) -> Tuple[str, Dict[str, str]]:
 # =====================================================================
 
 def _clean_html_soup(soup: BeautifulSoup) -> None:
-    """Helper function to decompose boilerplate, tables, and reference sections."""
-    # 1. Remove standard boilerplate + TABLES
-    for element in soup(["script", "style", "nav", "header", "footer", "aside", "table"]):
+    """Helper function to decompose boilerplate, tables, reference sections, ads, and high-density link blocks."""
+    # 1. Expand standard boilerplate removal
+    for element in soup(["script", "style", "nav", "header", "footer", "aside", "table", "form", "iframe", "noscript"]):
         element.decompose()
+
+    # 2. AD & PROMO FILTER: Remove elements by common ad, sidebar, and social media signatures
+    ad_signatures = re.compile(r'ad|advert|banner|sponsor|promo|sidebar|social|share|widget|popup', re.IGNORECASE)
+    for element in soup.find_all(['div', 'ul', 'section', 'span']):
+        # CRITICAL FIX: Skip elements that were already destroyed when a parent was decomposed
+        if element.attrs is None or not element.parent:
+            continue
+            
+        # Safely extract class and id, handling edge cases where class might be a string
+        classes = element.get('class', [])
+        class_str = " ".join(classes) if isinstance(classes, list) else str(classes)
+        id_str = element.get('id') or ""
         
-    # 2. Remove common inline citation tags/classes (e.g., Wikipedia superscripts, footnote links)
+        if ad_signatures.search(class_str + " " + id_str):
+            element.decompose()
+            
+    # 3. LINK DENSITY FILTER: Mathematically identify link farms and hidden menus
+    for block in soup.find_all(['div', 'ul', 'ol', 'section', 'li']):
+        # CRITICAL FIX: Skip destroyed elements here as well
+        if block.attrs is None or not block.parent:
+            continue
+            
+        text_length = len(block.get_text(strip=True))
+        if text_length == 0:
+            block.decompose()
+            continue
+            
+        # Calculate how much of the text inside this block is wrapped in an anchor <a> tag
+        link_text_length = sum(len(a.get_text(strip=True)) for a in block.find_all('a'))
+        link_density = link_text_length / text_length
+        
+        if link_density >= 0.50:
+            block.decompose()
+
+    # 4. Remove common inline citation tags/classes
     for ref_elem in soup.find_all(
         lambda tag: tag.name in ["sup", "ol", "ul", "div", "section"] and 
         any(
@@ -113,12 +164,15 @@ def _clean_html_soup(soup: BeautifulSoup) -> None:
             for cls in ["reference", "references", "citation", "citations", "cite", "biblio", "footnote"]
         )
     ):
-        ref_elem.decompose()
+        if ref_elem.parent:
+            ref_elem.decompose()
 
-    # 3. Strip trailing "References", "Sources Cited", or "Bibliography" sections by heading
+    # 5. Strip trailing "References", "Sources Cited", or "Bibliography" sections by heading
     for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        if not heading.parent:
+            continue
+            
         if REF_HEADING_PATTERN.match(heading.get_text(strip=True)):
-            # Remove all subsequent siblings (the actual reference list below the heading)
             for sibling in list(heading.find_next_siblings()):
                 sibling.decompose()
             heading.decompose()
@@ -127,8 +181,7 @@ def _clean_html_soup(soup: BeautifulSoup) -> None:
 def fetch_and_clean_html(url: str, timeout: int = 10) -> str:
     """
     Scrapes a web page, parses HTML using BeautifulSoup, and extracts 
-    clean body text while discarding headers, footers, scripts, nav bars,
-    tables, and obvious references/sources sections.
+    clean text while preserving block-level boundaries.
     """
     req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
     try:
@@ -137,26 +190,25 @@ def fetch_and_clean_html(url: str, timeout: int = 10) -> str:
             soup = BeautifulSoup(html, 'html.parser')
             
             _clean_html_soup(soup)
+            
+            # NEW: Inject hard boundaries around block-level tags to prevent text mashing
+            block_tags = ['p', 'div', 'article', 'section', 'blockquote', 'li', 'h1', 'h2', 'h3', 'br', 'hr']
+            for tag in soup.find_all(block_tags):
+                tag.insert_before('\n\n')
+                tag.insert_after('\n\n')
                 
-            # 4. Extract plain text from body
             body = soup.find('body')
-            if body:
-                text = body.get_text(separator=' ')
-            else:
-                text = soup.get_text(separator=' ')
-                
-            # 5. Clean up excessive whitespace
-            clean_lines = []
-            for line in text.splitlines():
-                line = line.strip()
-                if line:
-                    clean_lines.append(line)
-            return " ".join(clean_lines)
+            text = body.get_text(separator=' ') if body else soup.get_text(separator=' ')
+            
+            # Clean up excessive whitespace but preserve double newlines as block boundaries
+            clean_text = re.sub(r'[ \t]+', ' ', text)
+            clean_text = re.sub(r'\n\s*\n+', '\n\n', clean_text)
+            
+            return clean_text.strip()
             
     except Exception as e:
         print(f"Error fetching URL {url}: {e}")
         return ""
-
 
 # =====================================================================
 # 3. Collaborative Pipeline Components (Ollama & DDGS)
@@ -390,13 +442,15 @@ def run_web_rag_pipeline(question: str, slm_model: str = "qwen2.5:1.5b") -> str:
     
     if search_needed and keywords and keywords.lower() != "none":
         # 2. Web & News search (fetch general pages + recent news articles)
-        web_urls = web_search(keywords, max_results=2)
-        news_urls = news_search(keywords, max_results=2, timelimit="w")
+        question_urls = web_search(question, max_results=3)
+        question_news = news_search(question, max_results=3)
+        web_urls = web_search(keywords, max_results=3)
+        news_urls = news_search(keywords, max_results=3, timelimit="w")
         
         # Merge and deduplicate URLs while preserving order
         seen_urls = set()
         search_urls = []
-        for u in web_urls + news_urls:
+        for u in question_news + news_urls + question_urls + web_urls:
             if u not in seen_urls:
                 seen_urls.add(u)
                 search_urls.append(u)
@@ -421,7 +475,7 @@ def run_web_rag_pipeline(question: str, slm_model: str = "qwen2.5:1.5b") -> str:
             valid_segments = _extract_matched_segments(extracted_tags_str, tag_map)
             if valid_segments:
                 source_context = " ".join(valid_segments)
-                extracted_context_parts.append(f"[Source: {url}]: {source_context}")
+                extracted_context_parts.append(f"{source_context}")
                 print(f"  ✓ Successfully extracted {len(valid_segments)} relevant facts.")
             else:
                 print("  ✗ No relevant facts found in this source.")
@@ -432,6 +486,7 @@ def run_web_rag_pipeline(question: str, slm_model: str = "qwen2.5:1.5b") -> str:
     # Merge facts
     final_context = "\n\n".join(extracted_context_parts) if extracted_context_parts else ""
     
+    print("Final context: ", final_context)
     # 4. Final Answer Generation (Generative-LLM)
     print("\nGenerating final answer...")
     final_answer = generator_llm(question, final_context, model_name=slm_model)
@@ -444,8 +499,12 @@ def run_web_rag_pipeline(question: str, slm_model: str = "qwen2.5:1.5b") -> str:
 
 if __name__ == "__main__":
     # Test Question (Requires Real-time freshness)
-    question = "What is the capital of Wisconsin? "
+    # question = "What is the capital of Wisconsin? "
     # question = "In the news, what country did Donald Trump recently leave?"
     # question = "Who is the richest man in the world?"
-    # question = "Who won the latest Formula 1 race and what team do they drive for?"
+    question = "Who won the latest Formula 1 race and what team do they drive for?"
+    # question = "Is an orca a type of dolphin?"
     run_web_rag_pipeline(question)
+
+
+    # Error fetching URL  'NoneType' object has no attribute 'get'
